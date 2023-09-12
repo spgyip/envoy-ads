@@ -1,0 +1,9 @@
+[submodule "deps/envoy"]
+	path = deps/envoy
+	url = https://github.com/envoyproxy/envoy.git
+[submodule "deps/udpa"]
+	path = deps/udpa
+	url = https://github.com/cncf/udpa.git
+[submodule "deps/protoc-gen-validate"]
+	path = deps/protoc-gen-validate
+	url = https://github.com/bufbuild/protoc-gen-validate.git
