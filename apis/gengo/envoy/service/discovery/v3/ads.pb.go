@@ -7,7 +7,7 @@
 package discoveryv3
 
 import (
-	_ "github.com/cncf/udpa/udpa/annotations"
+	_ "github.com/cncf/xds/go/udpa/annotations"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
