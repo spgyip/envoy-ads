@@ -1,4 +1,6 @@
-.PHONY: apis cmd default
+.PHONY: apis cmd image default
+
+VERSION=$(shell git describe --always --dirty)
 
 GENGODIR="./apis/gengo"
 
@@ -25,7 +27,10 @@ apis:
         deps/envoy/api/envoy/service/discovery/v3/discovery.proto
 
 cmd:
-	go build -o bin/ ./cmd/*
+	go build -ldflags="-X main.version=${VERSION}" -o bin/ ./cmd/*
+
+image:
+	sudo docker build -t supergui/envoy-ads:$(VERSION) -f docker/Dockerfile .
 
 clean:
 	@rm -fv bin/*
