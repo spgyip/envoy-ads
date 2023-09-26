@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"reflect"
+	"sync"
 	"unsafe"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -19,11 +20,6 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
-
-type resourceInfo struct {
-	names   []string
-	version string
-}
 
 func retriveUserAgentVersion(node *corev3.Node) string {
 	userAgentVersion := "Unknown"
@@ -47,31 +43,82 @@ type aggDiscoveryServerImpl struct {
 }
 
 type subscriber struct {
+	// ``mu`` protect data(s) in ``subscriber``
+	mu                      sync.RWMutex
 	node                    *corev3.Node
-	respCh                  chan *discoveryv3.DiscoveryResponse
 	listenerResourceVersion string
 	clusterResourceVersion  string
+
+	respCh  chan *discoveryv3.DiscoveryResponse
+	closeCh chan bool
+	stream  discoveryv3.AggregatedDiscoveryService_StreamAggregatedResourcesServer
 }
 
-func newSubscriber() *subscriber {
-	return &subscriber{
-		respCh: make(chan *discoveryv3.DiscoveryResponse, 1),
+func newSubscriber(stream discoveryv3.AggregatedDiscoveryService_StreamAggregatedResourcesServer) *subscriber {
+	s := &subscriber{
+		stream:  stream,
+		closeCh: make(chan bool),
+		respCh:  make(chan *discoveryv3.DiscoveryResponse, 1),
 	}
+	s.run()
+	return s
+}
+
+func (s *subscriber) run() {
+	go func() {
+		running := true
+		for running {
+			select {
+			case resp := <-s.respCh:
+				zapS.Info("Sending DiscoveryResponse on stream")
+				if err := s.stream.Send(resp); err != nil {
+					running = false
+				}
+			case <-s.closeCh:
+				running = false
+			}
+		}
+		zapS.Info("Subscriber is closing")
+	}()
+}
+
+func (s *subscriber) close() {
+	close(s.closeCh)
 }
 
 func (s *subscriber) getNode() *corev3.Node {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.node
 }
 
 func (s *subscriber) setNode(node *corev3.Node) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.node = node
 }
 
-func (s *subscriber) subListenerResource(version string) {
+func (s *subscriber) getListenerResourceVersion() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.listenerResourceVersion
+}
+
+func (s *subscriber) setListenerResourceVersion(version string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.listenerResourceVersion = version
 }
 
-func (s *subscriber) subClusterResource(version string) {
+func (s *subscriber) getClusterResourceVersion() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.clusterResourceVersion
+}
+
+func (s *subscriber) setClusterResourceVersion(version string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.clusterResourceVersion = version
 }
 
@@ -79,39 +126,39 @@ func (s *subscriber) pushResource(resp *discoveryv3.DiscoveryResponse) {
 	s.respCh <- resp
 }
 
-// Local state listener
+// Local listener state
 type localListenerState struct {
 	version string
 	host    string
 	port    uint32
-	subs    map[uintptr]*subscriber
+
+	// DiscoveryResponse could be built once because the listener state is static
+	resp *discoveryv3.DiscoveryResponse
+
+	mu   sync.Mutex
+	subs map[uintptr]*subscriber
 
 	// Notify state changed or subscriber changed
 	notifyCh chan bool
 }
 
-func (s *localListenerState) addSubscriber(sub *subscriber) {
-	ptr := uintptr(unsafe.Pointer(sub))
-	s.subs[ptr] = sub
-}
-
-func (s *localListenerState) removeSubscriber(sub *subscriber) bool {
-	ptr := uintptr(unsafe.Pointer(sub))
-	if _, ok := s.subs[ptr]; ok {
-		delete(s.subs, ptr)
-		return true
+// TODO: New with config
+func newLocalListenerState() (*localListenerState, error) {
+	s := &localListenerState{
+		version:  "1",
+		host:     "127.0.0.1",
+		port:     9001,
+		subs:     make(map[uintptr]*subscriber),
+		notifyCh: make(chan bool, 1),
 	}
-	return false
-}
-
-func (s *localListenerState) notify() {
-	select {
-	case s.notifyCh <- true:
-	default:
+	if err := s.buildResponse(); err != nil {
+		return nil, errors.Wrap(err, "Build response error")
 	}
+	s.run()
+	return s, nil
 }
 
-func (s *localListenerState) start() {
+func (s *localListenerState) run() {
 	go func() {
 		for {
 			<-s.notifyCh
@@ -122,15 +169,43 @@ func (s *localListenerState) start() {
 }
 
 func (s *localListenerState) broadcast() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, sub := range s.subs {
-		if sub.listenerResourceVersion == "" {
-			s.pubResource(sub)
+		if sub.getListenerResourceVersion() < s.version {
+			sub.pushResource(s.resp)
 		}
 	}
 }
 
-func (s *localListenerState) pubResource(sub *subscriber) error {
-	zapS.Info("Handling localListenerState pushResource...")
+func (s *localListenerState) notify() {
+	select {
+	case s.notifyCh <- true:
+	default:
+	}
+}
+
+func (s *localListenerState) addSubscriber(sub *subscriber) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ptr := uintptr(unsafe.Pointer(sub))
+	if _, ok := s.subs[ptr]; !ok {
+		s.subs[ptr] = sub
+	}
+}
+
+func (s *localListenerState) removeSubscriber(sub *subscriber) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ptr := uintptr(unsafe.Pointer(sub))
+	if _, ok := s.subs[ptr]; ok {
+		delete(s.subs, ptr)
+		return true
+	}
+	return false
+}
+
+func (s *localListenerState) buildResponse() error {
 	var err error
 	var httpConnMgrProtoByte []byte
 	var listenerProtoByte []byte
@@ -194,7 +269,7 @@ func (s *localListenerState) pubResource(sub *subscriber) error {
 	}
 
 	// DiscoveryResponse
-	resp := &discoveryv3.DiscoveryResponse{
+	s.resp = &discoveryv3.DiscoveryResponse{
 		VersionInfo: s.version,
 		TypeUrl:     "type.googleapis.com/envoy.config.listener.v3.Listener",
 		Resources: []*anypb.Any{
@@ -205,34 +280,14 @@ func (s *localListenerState) pubResource(sub *subscriber) error {
 		},
 	}
 
-	// Send
-	sub.pushResource(resp)
 	return nil
 }
 
 func (s *aggDiscoveryServerImpl) StreamAggregatedResources(stream discoveryv3.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
-	sub := newSubscriber()
-	closeCh := make(chan bool, 1)
-
-	// Repsponse stream
-	go func() {
-		running := true
-		for running {
-			select {
-			case resp := <-sub.respCh:
-				zapS.Info("Sending DiscoveryResponse")
-				if err := stream.Send(resp); err != nil {
-					running = false
-				}
-			case <-closeCh:
-				running = false
-			}
-		}
-	}()
-
+	sub := newSubscriber(stream)
 	defer func() {
 		zapS.Infow("End of rpc, close read/write and remove subscriber from localState(s)")
-		close(closeCh)
+		sub.close()
 		lls.removeSubscriber(sub)
 	}()
 
@@ -271,7 +326,7 @@ func (s *aggDiscoveryServerImpl) StreamAggregatedResources(stream discoveryv3.Ag
 		if req.TypeUrl == "type.googleapis.com/envoy.config.listener.v3.Listener" {
 			zapS.Infow("Subscribe listener resource with version",
 				"version", req.VersionInfo)
-			sub.subListenerResource(req.VersionInfo)
+			sub.setListenerResourceVersion(req.VersionInfo)
 			lls.addSubscriber(sub)
 			lls.notify()
 		}
@@ -341,14 +396,11 @@ func main() {
 		return
 	}
 
-	lls = &localListenerState{
-		version:  "1",
-		host:     "127.0.0.1",
-		port:     9001,
-		subs:     make(map[uintptr]*subscriber),
-		notifyCh: make(chan bool, 1),
+	var err error
+	lls, err = newLocalListenerState()
+	if err != nil {
+		zapS.Fatalw("NewLocalListenerState error", "error", err)
 	}
-	lls.start()
 
 	zapL, _ = zap.NewProduction()
 	zapS = zapL.Sugar()
@@ -360,9 +412,9 @@ func main() {
 	zapS.Infow("Listening address", "addr", addr)
 	ls, err := net.Listen("tcp", addr)
 	if err != nil {
-		zapS.Fatalw("Fail to listen", "err", err)
+		zapS.Fatalw("Fail to listen", "error", err)
 	}
 	if err := s.Serve(ls); err != nil {
-		zapS.Fatalw("Fail to serve", "err", err)
+		zapS.Fatalw("Fail to serve", "error", err)
 	}
 }
