@@ -1,10 +1,10 @@
-.PHONY: apis cmd image default
+.PHONY: apis debug release image default
 
 VERSION=$(shell git describe --always --dirty)
 
 GENGODIR="./apis/gengo"
 
-default: cmd
+default: debug
 
 apis:
 	@test -d ${GENGODIR} || mkdir -p ${GENGODIR}
@@ -26,8 +26,11 @@ apis:
         deps/envoy/api/envoy/service/discovery/v3/ads.proto \
         deps/envoy/api/envoy/service/discovery/v3/discovery.proto
 
-cmd:
-	go build -ldflags="-X main.version=${VERSION}" -o bin/ ./cmd/*
+debug:
+	go build -ldflags="-X main.version=${VERSION} -X main.build=debug" -o bin/ ./cmd/*
+
+release:
+	go build -ldflags="-X main.version=${VERSION} -X main.build=release" -o bin/ ./cmd/*
 
 image:
 	sudo docker build -t supergui/envoy-ads:$(VERSION) -f docker/Dockerfile .

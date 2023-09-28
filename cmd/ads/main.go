@@ -18,16 +18,17 @@ const (
 
 var (
 	// Program name
-	program = "ads"
+	program = "Ads"
 	// Ads version
 	// Set with ``go build -ldflags="-X main.version=..."``
 	version = "unknown"
+
+	// Release built
+	// Set with ``go build -ldflags="-X main.build=..."``
+	build = "debug"
 )
 
-var zapL *zap.Logger
-var zapS *zap.SugaredLogger
-
-var lls *localListenerState
+var g_lls *localListenerState
 
 func main() {
 	olayc.Load(
@@ -39,28 +40,33 @@ func main() {
 
 	if showV {
 		fmt.Printf("%v: %v\n", program, version)
+		fmt.Printf("Build: %v\n", build)
 		return
 	}
 
+	var logger *zap.Logger
+	if build != "debug" {
+		logger, _ = zap.NewProduction()
+	} else {
+		logger, _ = zap.NewDevelopment()
+	}
+	defer logger.Sync()
+	loggerS := logger.Sugar()
+
 	var err error
-	lls, err = newLocalListenerState()
+	g_lls, err = newLocalListenerState(logger)
 	if err != nil {
-		zapS.Fatalw("NewLocalListenerState error", "error", err)
+		loggerS.Fatalw("NewLocalListenerState error", "error", err)
 	}
 
-	zapL, _ = zap.NewProduction()
-	zapS = zapL.Sugar()
-	defer zapL.Sync()
-
+	loggerS.Infow("Listening address", "addr", addr)
 	s := grpc.NewServer()
-	discoveryv3.RegisterAggregatedDiscoveryServiceServer(s, &aggDiscoveryServerImpl{})
-
-	zapS.Infow("Listening address", "addr", addr)
+	discoveryv3.RegisterAggregatedDiscoveryServiceServer(s, &aggDiscoveryServerImpl{logger: logger})
 	ls, err := net.Listen("tcp", addr)
 	if err != nil {
-		zapS.Fatalw("Fail to listen", "error", err)
+		loggerS.Fatalw("Fail to listen", "error", err)
 	}
 	if err := s.Serve(ls); err != nil {
-		zapS.Fatalw("Fail to serve", "error", err)
+		loggerS.Fatalw("Fail to serve", "error", err)
 	}
 }
