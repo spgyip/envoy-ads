@@ -7,6 +7,7 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discoveryv3 "github.com/spgyip/envoy-ads/apis/gengo/envoy/service/discovery/v3"
+	"go.uber.org/zap"
 )
 
 func retriveUserAgentVersion(node *corev3.Node) string {
@@ -28,22 +29,22 @@ func retriveUserAgentVersion(node *corev3.Node) string {
 
 type aggDiscoveryServerImpl struct {
 	discoveryv3.UnimplementedAggregatedDiscoveryServiceServer
+	logger *zap.Logger
 }
 
 func (s *aggDiscoveryServerImpl) StreamAggregatedResources(stream discoveryv3.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
-	sub := newSubscriber(stream)
+	sub := newAggStreamSubscriber(stream, s.logger)
 	defer func() {
-		zapS.Infow("End of rpc, close read/write and remove subscriber from localState(s)")
-		sub.close()
-		lls.removeSubscriber(sub)
+		s.logger.Info("End of StreamAggregatedResources, close read/write and remove subscriber from localState(s)")
+		sub.Close()
 	}()
 
 	for {
 		req, err := stream.Recv()
 		if err != nil {
-			zapS.Errorw(
-				"Stream recv error, end the RPC",
-				"error", err,
+			s.logger.Error(
+				"ResourceStream recv error, end the RPC",
+				zap.Error(err),
 			)
 			if err == io.EOF {
 				return nil
@@ -51,31 +52,30 @@ func (s *aggDiscoveryServerImpl) StreamAggregatedResources(stream discoveryv3.Ag
 			return err
 		}
 
-		zapS.Infow(
-			"DiscoveryRequest",
-			"VersionInfo", req.VersionInfo,
-			"ResourceNames", req.ResourceNames,
-			"TypeUrl", req.TypeUrl,
-			"ResponseNonce", req.ResponseNonce,
-		)
-
-		if sub.getNode() == nil {
-			zapS.Infow("Node",
-				"ID", req.Node.Id,
-				"Cluster", req.Node.Cluster,
-				"Locality", req.Node.Locality,
-				"UserAgent", req.Node.UserAgentName,
-				"UserAgentVersion", retriveUserAgentVersion(req.Node),
+		if sub.SetNode(req.Node) {
+			s.logger.Debug("Node establishs a new stream",
+				zap.String("ID", req.Node.Id),
+				zap.String("Cluster", req.Node.Cluster),
+				zap.Any("Locality", req.Node.Locality),
+				zap.String("UserAgent", req.Node.UserAgentName),
+				zap.String("UserAgentVersion", retriveUserAgentVersion(req.Node)),
 			)
-			sub.setNode(req.Node)
 		}
 
+		s.logger.Debug(
+			"DiscoveryRequest",
+			zap.String("VersionInfo", req.VersionInfo),
+			zap.Any("ResourceNames", req.ResourceNames),
+			zap.String("TypeUrl", req.TypeUrl),
+			zap.String("ResponseNonce", req.ResponseNonce),
+		)
+
 		if req.TypeUrl == "type.googleapis.com/envoy.config.listener.v3.Listener" {
-			zapS.Infow("Subscribe listener resource with version",
-				"version", req.VersionInfo)
-			sub.setListenerResourceVersion(req.VersionInfo)
-			lls.addSubscriber(sub)
-			lls.notify()
+			s.logger.Debug("Subscribe listener resource with version",
+				zap.String("version", req.VersionInfo),
+			)
+			sub.WatchListener(g_lls, req.VersionInfo)
+			g_lls.notify()
 		}
 		/*
 			switch req.TypeUrl {
@@ -94,7 +94,6 @@ func (s *aggDiscoveryServerImpl) StreamAggregatedResources(stream discoveryv3.Ag
 }
 
 func handleDiscoveryCluster(stream discoveryv3.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
-	zapS.Info("Handling discovery cluster...")
 	// TODO
 	return nil
 }

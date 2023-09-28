@@ -2,16 +2,25 @@ package main
 
 import (
 	"sync"
-	"unsafe"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"github.com/pkg/errors"
 	discoveryv3 "github.com/spgyip/envoy-ads/apis/gengo/envoy/service/discovery/v3"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
+
+type localState interface {
+	// Add subscriber if not exists
+	// Return false if already exists
+	AddSubscriber(subscriber) bool
+	// Remove subscriber if exists
+	// Return false if already exists
+	RemoveSubscriber(subscriber) bool
+}
 
 // Local listener state
 type localListenerState struct {
@@ -23,76 +32,81 @@ type localListenerState struct {
 	resp *discoveryv3.DiscoveryResponse
 
 	mu   sync.Mutex
-	subs map[uintptr]*subscriber
+	subs map[uint64]subscriber
 
 	// Notify state changed or subscriber changed
 	notifyCh chan bool
+
+	logger *zap.Logger
 }
 
 // TODO: New with config
-func newLocalListenerState() (*localListenerState, error) {
-	s := &localListenerState{
+func newLocalListenerState(logger *zap.Logger) (*localListenerState, error) {
+	ls := &localListenerState{
 		version:  "1",
 		host:     "127.0.0.1",
 		port:     9001,
-		subs:     make(map[uintptr]*subscriber),
+		subs:     make(map[uint64]subscriber),
 		notifyCh: make(chan bool, 1),
+		logger:   logger,
 	}
-	if err := s.buildResponse(); err != nil {
+	if err := ls.buildResponse(); err != nil {
 		return nil, errors.Wrap(err, "Build response error")
 	}
-	s.run()
-	return s, nil
+	ls.run()
+	return ls, nil
 }
 
-func (s *localListenerState) run() {
-	go func() {
-		for {
-			<-s.notifyCh
-			zapS.Info("LocalListernerState notify fired, check subscribers and publish resources")
-			s.broadcast()
-		}
-	}()
-}
+func (ls *localListenerState) AddSubscriber(sub subscriber) bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
 
-func (s *localListenerState) broadcast() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, sub := range s.subs {
-		if sub.getListenerResourceVersion() < s.version {
-			sub.pushResource(s.resp)
-		}
-	}
-}
-
-func (s *localListenerState) notify() {
-	select {
-	case s.notifyCh <- true:
-	default:
-	}
-}
-
-func (s *localListenerState) addSubscriber(sub *subscriber) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ptr := uintptr(unsafe.Pointer(sub))
-	if _, ok := s.subs[ptr]; !ok {
-		s.subs[ptr] = sub
-	}
-}
-
-func (s *localListenerState) removeSubscriber(sub *subscriber) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ptr := uintptr(unsafe.Pointer(sub))
-	if _, ok := s.subs[ptr]; ok {
-		delete(s.subs, ptr)
+	sid := sub.Id()
+	if _, ok := ls.subs[sid]; !ok {
+		ls.subs[sid] = sub
 		return true
 	}
 	return false
 }
 
-func (s *localListenerState) buildResponse() error {
+func (ls *localListenerState) RemoveSubscriber(sub subscriber) bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	sid := sub.Id()
+	if _, ok := ls.subs[sid]; ok {
+		delete(ls.subs, sid)
+		return true
+	}
+	return false
+}
+
+func (ls *localListenerState) run() {
+	go func() {
+		for {
+			<-ls.notifyCh
+			ls.logger.Debug("LocalListernerState notify fired, check subscribers and publish resources")
+			ls.broadcast()
+		}
+	}()
+}
+
+func (ls *localListenerState) broadcast() {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	for _, sub := range ls.subs {
+		sub.PublishListener(ls.version, ls.resp)
+	}
+}
+
+func (ls *localListenerState) notify() {
+	select {
+	case ls.notifyCh <- true:
+	default:
+	}
+}
+
+func (ls *localListenerState) buildResponse() error {
 	var err error
 	var httpConnMgrProtoByte []byte
 	var listenerProtoByte []byte
@@ -133,9 +147,9 @@ func (s *localListenerState) buildResponse() error {
 			Address: &corev3.Address_SocketAddress{
 				SocketAddress: &corev3.SocketAddress{
 					Protocol: corev3.SocketAddress_TCP,
-					Address:  s.host,
+					Address:  ls.host,
 					PortSpecifier: &corev3.SocketAddress_PortValue{
-						PortValue: s.port,
+						PortValue: ls.port,
 					},
 				},
 			},
@@ -156,8 +170,8 @@ func (s *localListenerState) buildResponse() error {
 	}
 
 	// DiscoveryResponse
-	s.resp = &discoveryv3.DiscoveryResponse{
-		VersionInfo: s.version,
+	ls.resp = &discoveryv3.DiscoveryResponse{
+		VersionInfo: ls.version,
 		TypeUrl:     "type.googleapis.com/envoy.config.listener.v3.Listener",
 		Resources: []*anypb.Any{
 			&anypb.Any{
